@@ -52,6 +52,7 @@ public struct DeviceProfile: Codable, Hashable, Sendable {
     public let cpuCores: Int
     public let memoryBytes: Int64
     public let freeDiskBytes: Int64?
+    public let totalDiskBytes: Int64?
     /// `iOS` / `iPadOS` / `macOS` / `visionOS`.
     public let osName: String
     /// `26.1`, `17.4.1`, etc.
@@ -67,6 +68,7 @@ public struct DeviceProfile: Codable, Hashable, Sendable {
         cpuCores: Int,
         memoryBytes: Int64,
         freeDiskBytes: Int64?,
+        totalDiskBytes: Int64?,
         osName: String,
         osVersion: String,
         batteryState: BatteryState,
@@ -79,11 +81,35 @@ public struct DeviceProfile: Codable, Hashable, Sendable {
         self.cpuCores = cpuCores
         self.memoryBytes = memoryBytes
         self.freeDiskBytes = freeDiskBytes
+        self.totalDiskBytes = totalDiskBytes
         self.osName = osName
         self.osVersion = osVersion
         self.batteryState = batteryState
         self.lowPowerMode = lowPowerMode
         self.thermalState = thermalState
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case formFactor, modelIdentifier, chip, cpuCores, memoryBytes
+        case freeDiskBytes, totalDiskBytes
+        case osName, osVersion, batteryState, lowPowerMode, thermalState
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        formFactor = try c.decodeIfPresent(FormFactor.self, forKey: .formFactor) ?? .unknown
+        modelIdentifier = try c.decodeIfPresent(String.self, forKey: .modelIdentifier) ?? "unknown"
+        chip = try c.decodeIfPresent(String.self, forKey: .chip)
+        cpuCores = try c.decodeIfPresent(Int.self, forKey: .cpuCores) ?? 0
+        memoryBytes = try c.decodeIfPresent(Int64.self, forKey: .memoryBytes) ?? 0
+        freeDiskBytes = try c.decodeIfPresent(Int64.self, forKey: .freeDiskBytes)
+        totalDiskBytes = try c.decodeIfPresent(Int64.self, forKey: .totalDiskBytes)
+        osName = try c.decodeIfPresent(String.self, forKey: .osName) ?? "Apple"
+        osVersion = try c.decodeIfPresent(String.self, forKey: .osVersion) ?? ""
+        batteryState = try c.decodeIfPresent(BatteryState.self, forKey: .batteryState)
+            ?? BatteryState(status: .unknown, level: nil)
+        lowPowerMode = try c.decodeIfPresent(Bool.self, forKey: .lowPowerMode) ?? false
+        thermalState = try c.decodeIfPresent(ThermalState.self, forKey: .thermalState) ?? .unknown
     }
 }
 
@@ -108,6 +134,25 @@ public extension DeviceProfile {
     var freeDiskGB: Double? {
         guard let freeDiskBytes else { return nil }
         return Double(freeDiskBytes) / 1_073_741_824
+    }
+
+    var totalDiskGB: Double? {
+        guard let totalDiskBytes else { return nil }
+        return Double(totalDiskBytes) / 1_073_741_824
+    }
+
+    /// `"812 GB free of 2 TB"` / `"812 GB free"` / nil if neither known.
+    var diskSummary: String? {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useGB, .useTB]
+        if let free = freeDiskBytes, let total = totalDiskBytes {
+            return "\(formatter.string(fromByteCount: free)) free of \(formatter.string(fromByteCount: total))"
+        }
+        if let free = freeDiskBytes {
+            return "\(formatter.string(fromByteCount: free)) free"
+        }
+        return nil
     }
 
     /// One-liner for compact UI: `Apple M3 Max · 64 GB · macOS 26.1 · plugged in`.

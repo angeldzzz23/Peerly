@@ -20,13 +20,15 @@ public extension DeviceProfile {
 
     @MainActor
     static func current() -> DeviceProfile {
-        DeviceProfile(
+        let disk = resolveDisk()
+        return DeviceProfile(
             formFactor: resolveFormFactor(),
             modelIdentifier: sysctlString("hw.machine") ?? "unknown",
             chip: resolveChip(),
             cpuCores: ProcessInfo.processInfo.activeProcessorCount,
             memoryBytes: Int64(ProcessInfo.processInfo.physicalMemory),
-            freeDiskBytes: resolveFreeDisk(),
+            freeDiskBytes: disk.free,
+            totalDiskBytes: disk.total,
             osName: resolveOSName(),
             osVersion: resolveOSVersion(),
             batteryState: resolveBatteryState(),
@@ -91,15 +93,14 @@ public extension DeviceProfile {
 
     // MARK: - Disk
 
-    private static func resolveFreeDisk() -> Int64? {
+    private static func resolveDisk() -> (free: Int64?, total: Int64?) {
         let path = NSHomeDirectory()
         guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path) else {
-            return nil
+            return (nil, nil)
         }
-        if let size = attrs[.systemFreeSize] as? NSNumber {
-            return size.int64Value
-        }
-        return nil
+        let free = (attrs[.systemFreeSize] as? NSNumber)?.int64Value
+        let total = (attrs[.systemSize] as? NSNumber)?.int64Value
+        return (free, total)
     }
 
     // MARK: - Battery
