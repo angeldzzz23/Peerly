@@ -26,6 +26,9 @@ public final class PeerService: NSObject {
     private static let discoveryServicesKey = "s"
 
     public let myPeer: Peer
+    /// Hardware + OS specs for this device. Resolved once at init and
+    /// embedded in every outgoing `hello`.
+    public let myProfile: DeviceProfile
 
     @ObservationIgnored nonisolated(unsafe) private let myMCPeerID: MCPeerID
     @ObservationIgnored nonisolated(unsafe) private let session: MCSession
@@ -82,6 +85,7 @@ public final class PeerService: NSObject {
         let mcID = MCPeerID(displayName: resolvedName)
         self.myMCPeerID = mcID
         self.myPeer = Peer(id: resolvedName, displayName: resolvedName)
+        self.myProfile = DeviceProfile.current()
 
         session = MCSession(peer: mcID, securityIdentity: nil, encryptionPreference: .required)
         browser = MCNearbyServiceBrowser(peer: mcID, serviceType: Self.serviceType)
@@ -198,7 +202,12 @@ public final class PeerService: NSObject {
     // MARK: - Internals
 
     private func currentHello(busy: Bool = false) -> HelloPayload {
-        HelloPayload(deviceName: myPeer.displayName, services: advertisedServices, busy: busy)
+        HelloPayload(
+            deviceName: myPeer.displayName,
+            services: advertisedServices,
+            busy: busy,
+            profile: myProfile
+        )
     }
 
     private func republishAdvertisement() {
