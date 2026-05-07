@@ -21,9 +21,9 @@ public struct Peer: Hashable, Identifiable, Sendable {
     }
 }
 
-/// Connection state with respect to a peer.
-public enum ConnectionStatus: Hashable, Sendable {
+/// Per-peer connection state.
+public enum PeerConnectionState: String, Hashable, Sendable {
     case notConnected
-    case connecting(Peer)
-    case connected(Peer)
+    case connecting
+    case connected
 }

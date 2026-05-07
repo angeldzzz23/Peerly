@@ -10,12 +10,13 @@ import Observation
 import UIKit
 #endif
 
-/// Discovery + 1:1 connection + service-routing transport.
+/// Discovery + N-peer connection + service-routing transport.
 ///
-/// Hosts register `Service` instances for capabilities they offer. Clients
-/// call `client(of:on:).stream(...)` to invoke a remote peer's service.
-/// The library is model-agnostic — it knows about service ids and opaque
-/// payloads, nothing more.
+/// Each peer pairing gets its own `MCSession`, so disconnecting one peer
+/// doesn't affect the others. Hosts register `Service` instances for
+/// capabilities they offer; clients call `client(of:on:).stream(...)` to
+/// invoke a remote peer's service. The library is model-agnostic — it
+/// knows about service ids and opaque payloads, nothing more.
 @Observable
 @MainActor
 public final class PeerService: NSObject {
@@ -31,44 +32,59 @@ public final class PeerService: NSObject {
     public let myProfile: DeviceProfile
 
     @ObservationIgnored nonisolated(unsafe) private let myMCPeerID: MCPeerID
-    @ObservationIgnored nonisolated(unsafe) private let session: MCSession
     @ObservationIgnored nonisolated(unsafe) private let browser: MCNearbyServiceBrowser
     @ObservationIgnored nonisolated(unsafe) private var advertiser: MCNearbyServiceAdvertiser
 
-    public private(set) var connectionStatus: ConnectionStatus = .notConnected
+    /// One MCSession per peer pairing. Keyed by `Peer.id` (currently the
+    /// peer's display name). Lifecycle: created on outgoing `connect(to:)`
+    /// or incoming invitation, destroyed when the session goes
+    /// `.notConnected`.
+    @ObservationIgnored
+    private var sessions: [Peer.ID: MCSession] = [:]
+
+    public private(set) var connectedPeers: [Peer] = []
+    public private(set) var connectingPeers: Set<Peer.ID> = []
     public private(set) var availablePeers: [Peer] = []
-    /// Last-known capability snapshot per peer, keyed by `Peer.id`. Populated
-    /// from advertised `discoveryInfo` on first sight (services only, no
-    /// metadata) and overwritten by the post-connect `hello` (full metadata).
+    /// Last-known capability snapshot per peer. Populated from
+    /// `discoveryInfo` on first sight (services only) and overwritten by
+    /// the post-connect `hello` (full metadata).
     public private(set) var peerHellos: [Peer.ID: HelloPayload] = [:]
     /// What this device is currently advertising — service id + metadata.
-    /// Mirrors the `services` array sent in our outgoing `hello`, kept
-    /// observable so the UI can render "what models are loaded here."
+    /// Mirrors the `services` array sent in our outgoing `hello`.
     public private(set) var advertisedServices: [ServiceCapability] = []
 
-    /// Fired when a peer disappears (manual disconnect or peer drop). Lets
-    /// app-level code reset state.
+    /// Fired when a specific peer disappears. Lets app-level code reset
+    /// state pointing at that peer (e.g., `BackendChoice.remote(peer)` →
+    /// `.local`).
     @ObservationIgnored
-    public var onPeerDisconnect: (() -> Void)?
+    public var onPeerDisconnect: ((Peer) -> Void)?
 
-    // MARK: - Private state
-
-    /// MCPeerID instances keyed by Peer.id — needed because MultipeerConnectivity
-    /// matches on identity, not displayName.
     @ObservationIgnored
     private var mcPeerIDs: [Peer.ID: MCPeerID] = [:]
 
-    /// Registered server-side services keyed by service id.
     @ObservationIgnored
     private var services: [String: RegisteredService] = [:]
 
-    /// Client-side in-flight requests: id → stream continuation.
+    /// Client-side in-flight requests. Each tracks which peer it's bound to
+    /// so we can fail just that peer's requests on per-peer disconnect.
     @ObservationIgnored
-    private var clientInflight: [UUID: AsyncThrowingStream<Data, Error>.Continuation] = [:]
+    private var clientInflight: [UUID: ClientRequest] = [:]
 
-    /// Server-side in-flight tasks: id → task running the service.
+    /// Server-side in-flight tasks. Each tracks which peer originated the
+    /// request so we can cancel just that peer's tasks on per-peer
+    /// disconnect.
     @ObservationIgnored
-    private var serverInflight: [UUID: Task<Void, Never>] = [:]
+    private var serverInflight: [UUID: ServerRequest] = [:]
+
+    private struct ClientRequest {
+        let peerID: Peer.ID
+        let continuation: AsyncThrowingStream<Data, Error>.Continuation
+    }
+
+    private struct ServerRequest {
+        let peerID: Peer.ID
+        let task: Task<Void, Never>
+    }
 
     // MARK: - Init
 
@@ -87,13 +103,11 @@ public final class PeerService: NSObject {
         self.myPeer = Peer(id: resolvedName, displayName: resolvedName)
         self.myProfile = DeviceProfile.current()
 
-        session = MCSession(peer: mcID, securityIdentity: nil, encryptionPreference: .required)
         browser = MCNearbyServiceBrowser(peer: mcID, serviceType: Self.serviceType)
         advertiser = MCNearbyServiceAdvertiser(peer: mcID, discoveryInfo: nil, serviceType: Self.serviceType)
 
         super.init()
 
-        session.delegate = self
         browser.delegate = self
         advertiser.delegate = self
 
@@ -103,22 +117,19 @@ public final class PeerService: NSObject {
 
     // MARK: - Service registration
 
-    /// Register a service implementation. Republishes the advertisement so
-    /// nearby peers see the new capability.
     public func register<S: Service>(_ service: S) {
         let id = S.Contract.id
         services[id] = RegisteredService.from(service)
         refreshAdvertisedServices()
         republishAdvertisement()
-        sendHelloToConnectedPeer()
+        sendHelloToConnectedPeers()
     }
 
-    /// Remove a previously-registered service.
     public func unregister(serviceID: String) {
         services.removeValue(forKey: serviceID)
         refreshAdvertisedServices()
         republishAdvertisement()
-        sendHelloToConnectedPeer()
+        sendHelloToConnectedPeers()
     }
 
     private func refreshAdvertisedServices() {
@@ -127,33 +138,55 @@ public final class PeerService: NSObject {
             .sorted(by: { $0.id < $1.id })
     }
 
-    /// Service ids this device currently offers, for advertising.
     public var registeredServiceIDs: [String] {
         Array(services.keys).sorted()
     }
 
     // MARK: - Connection management
 
-    public var connectedPeer: Peer? {
-        if case .connected(let peer) = connectionStatus { return peer }
-        return nil
+    /// State for one specific peer.
+    public func connectionState(for peer: Peer) -> PeerConnectionState {
+        if connectedPeers.contains(where: { $0.id == peer.id }) { return .connected }
+        if connectingPeers.contains(peer.id) { return .connecting }
+        return .notConnected
     }
+
+    /// True if at least one peer is currently connected.
+    public var hasAnyConnection: Bool { !connectedPeers.isEmpty }
 
     public func connect(to peer: Peer) {
         guard let mcID = mcPeerIDs[peer.id] else {
             print("PeerService: connect — unknown peer \(peer.displayName)")
             return
         }
-        connectionStatus = .connecting(peer)
+        let session = ensureSession(for: peer.id)
+        connectingPeers.insert(peer.id)
         browser.invitePeer(mcID, to: session, withContext: nil, timeout: 30)
     }
 
-    public func disconnect() {
-        session.disconnect()
-        connectionStatus = .notConnected
-        failAllClientInflight()
-        cancelAllServerInflight()
-        onPeerDisconnect?()
+    /// Drop the pairing with one specific peer. Other peers stay connected.
+    public func disconnect(peer: Peer) {
+        sessions[peer.id]?.disconnect()
+        // Cleanup happens in the `.notConnected` delegate callback.
+    }
+
+    /// Drop pairings with every connected peer at once.
+    public func disconnectAll() {
+        for session in sessions.values {
+            session.disconnect()
+        }
+    }
+
+    private func ensureSession(for peerID: Peer.ID) -> MCSession {
+        if let existing = sessions[peerID] { return existing }
+        let session = MCSession(
+            peer: myMCPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .required
+        )
+        session.delegate = self
+        sessions[peerID] = session
+        return session
     }
 
     // MARK: - Typed client
@@ -167,32 +200,29 @@ public final class PeerService: NSObject {
 
     // MARK: - Raw client
 
-    /// Low-level: send a raw payload to a peer's service and stream raw bytes
-    /// back. `ServiceClient` is the typed sugar over this.
     public func requestRaw(
         serviceID: String,
         payload: Data,
         on peer: Peer
     ) -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in
-            guard connectedPeer == peer else {
+            guard self.connectionState(for: peer) == .connected else {
                 print("PeerService: requestRaw — not connected to \(peer.displayName)")
                 continuation.finish(throwing: PeerError.notConnected)
                 return
             }
             let id = UUID()
             let shortID = id.uuidString.prefix(8)
-            clientInflight[id] = continuation
+            clientInflight[id] = ClientRequest(peerID: peer.id, continuation: continuation)
             print("PeerService: → request id=\(shortID) service=\(serviceID) to=\(peer.displayName) bytes=\(payload.count)")
             sendEnvelope(.request(id: id, serviceID: serviceID, payload: payload), to: peer)
 
             continuation.onTermination = { [weak self] _ in
                 Task { @MainActor in
                     guard let self else { return }
-                    if self.clientInflight.removeValue(forKey: id) != nil,
-                       let p = self.connectedPeer {
-                        print("PeerService: → cancel id=\(shortID) to=\(p.displayName)")
-                        self.sendEnvelope(.cancel(id: id), to: p)
+                    if self.clientInflight.removeValue(forKey: id) != nil {
+                        print("PeerService: → cancel id=\(shortID) to=\(peer.displayName)")
+                        self.sendEnvelope(.cancel(id: id), to: peer)
                     }
                 }
             }
@@ -218,45 +248,50 @@ public final class PeerService: NSObject {
         } else {
             info = [Self.discoveryServicesKey: services.keys.sorted().joined(separator: ",")]
         }
-        // Reuse the same MCPeerID the session was created with — recreating
-        // the advertiser with a fresh MCPeerID makes invitations land on a
-        // different identity than the session, breaking the handshake.
-        advertiser = MCNearbyServiceAdvertiser(peer: myMCPeerID, discoveryInfo: info, serviceType: Self.serviceType)
+        advertiser = MCNearbyServiceAdvertiser(
+            peer: myMCPeerID,
+            discoveryInfo: info,
+            serviceType: Self.serviceType
+        )
         advertiser.delegate = self
         advertiser.startAdvertisingPeer()
     }
 
-    private func sendHelloToConnectedPeer() {
-        guard let peer = connectedPeer else { return }
-        sendEnvelope(.hello(currentHello()), to: peer)
+    private func sendHelloToConnectedPeers() {
+        let hello = currentHello()
+        for peer in connectedPeers {
+            sendEnvelope(.hello(hello), to: peer)
+        }
     }
 
     private func sendEnvelope(_ envelope: PeerEnvelope, to peer: Peer) {
-        guard let mcID = mcPeerIDs[peer.id] else { return }
-        sendEnvelope(envelope, toMC: [mcID])
-    }
-
-    private func sendEnvelope(_ envelope: PeerEnvelope, toMC peers: [MCPeerID]) {
-        guard !peers.isEmpty else { return }
+        guard let mcID = mcPeerIDs[peer.id], let session = sessions[peer.id] else { return }
         do {
             let data = try JSONEncoder().encode(envelope)
-            try session.send(data, toPeers: peers, with: .reliable)
+            try session.send(data, toPeers: [mcID], with: .reliable)
         } catch {
             print("PeerService: send failed: \(error.localizedDescription)")
         }
     }
 
-    private func failAllClientInflight() {
-        let entries = clientInflight
-        clientInflight.removeAll()
-        for cont in entries.values {
-            cont.finish(throwing: PeerError.notConnected)
+    private func failClientInflight(forPeer peerID: Peer.ID) {
+        let toFail = clientInflight.filter { $0.value.peerID == peerID }
+        for (id, _) in toFail {
+            clientInflight.removeValue(forKey: id)
+        }
+        for (_, req) in toFail {
+            req.continuation.finish(throwing: PeerError.notConnected)
         }
     }
 
-    private func cancelAllServerInflight() {
-        for task in serverInflight.values { task.cancel() }
-        serverInflight.removeAll()
+    private func cancelServerInflight(forPeer peerID: Peer.ID) {
+        let toCancel = serverInflight.filter { $0.value.peerID == peerID }
+        for (id, _) in toCancel {
+            serverInflight.removeValue(forKey: id)
+        }
+        for (_, req) in toCancel {
+            req.task.cancel()
+        }
     }
 
     fileprivate func handle(_ envelope: PeerEnvelope, from peer: Peer) {
@@ -273,19 +308,25 @@ public final class PeerService: NSObject {
         case .chunk(let id, let payload):
             let shortID = id.uuidString.prefix(8)
             print("PeerService: ← chunk id=\(shortID) bytes=\(payload.count)")
-            clientInflight[id]?.yield(payload)
+            clientInflight[id]?.continuation.yield(payload)
 
         case .done(let id):
             print("PeerService: ← done id=\(id.uuidString.prefix(8))")
-            clientInflight.removeValue(forKey: id)?.finish()
+            if let req = clientInflight.removeValue(forKey: id) {
+                req.continuation.finish()
+            }
 
         case .cancel(let id):
             print("PeerService: ← cancel id=\(id.uuidString.prefix(8)) from=\(peer.displayName)")
-            serverInflight.removeValue(forKey: id)?.cancel()
+            if let req = serverInflight.removeValue(forKey: id) {
+                req.task.cancel()
+            }
 
         case .error(let id, let message):
             print("PeerService: ← error id=\(id.uuidString.prefix(8)) msg='\(message)'")
-            clientInflight.removeValue(forKey: id)?.finish(throwing: PeerError.remote(message))
+            if let req = clientInflight.removeValue(forKey: id) {
+                req.continuation.finish(throwing: PeerError.remote(message))
+            }
         }
     }
 
@@ -295,7 +336,7 @@ public final class PeerService: NSObject {
             return
         }
         let context = ServiceCallContext(peer: peer, requestID: id)
-        serverInflight[id] = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             let stream = service.handler(payload, context)
             do {
@@ -310,18 +351,22 @@ public final class PeerService: NSObject {
             }
             self.serverInflight.removeValue(forKey: id)
         }
+        serverInflight[id] = ServerRequest(peerID: peer.id, task: task)
     }
 }
 
-// MARK: - Internal: Sendable wrapper for MCPeerID
+// MARK: - Internal: Sendable wrappers for MultipeerConnectivity types
 
-/// MultipeerConnectivity types aren't `Sendable`-annotated, but MCPeerID
-/// instances are immutable from the user's perspective. Wrap them in an
-/// `@unchecked Sendable` box so we can hand them across the actor boundary
-/// from nonisolated delegate callbacks into our @MainActor body.
+/// MultipeerConnectivity types aren't `Sendable`-annotated, but we only
+/// pass them across the actor boundary in immutable ways.
 private struct SendableMCPeerID: @unchecked Sendable {
     let value: MCPeerID
     init(_ value: MCPeerID) { self.value = value }
+}
+
+private struct SendableMCSession: @unchecked Sendable {
+    let value: MCSession
+    init(_ value: MCSession) { self.value = value }
 }
 
 // MARK: - Internal: type-erased registered service
@@ -380,20 +425,27 @@ extension PeerService: MCSessionDelegate {
             switch state {
             case .connected:
                 print("PeerService: peer connected — \(displayName)")
-                self.connectionStatus = .connected(peer)
-                self.availablePeers.removeAll { $0.id == peer.id }
+                self.connectingPeers.remove(displayName)
+                if !self.connectedPeers.contains(where: { $0.id == displayName }) {
+                    self.connectedPeers.append(peer)
+                }
+                self.availablePeers.removeAll { $0.id == displayName }
                 self.sendEnvelope(.hello(self.currentHello()), to: peer)
             case .connecting:
                 print("PeerService: peer connecting — \(displayName)")
-                self.connectionStatus = .connecting(peer)
+                self.connectingPeers.insert(displayName)
             case .notConnected:
                 print("PeerService: peer disconnected — \(displayName)")
-                self.peerHellos[peer.id] = nil
-                if self.activePeerID == peer.id {
-                    self.connectionStatus = .notConnected
-                    self.failAllClientInflight()
-                    self.cancelAllServerInflight()
-                    self.onPeerDisconnect?()
+                let wasKnown = self.connectedPeers.contains(where: { $0.id == displayName })
+                    || self.connectingPeers.contains(displayName)
+                self.connectingPeers.remove(displayName)
+                self.connectedPeers.removeAll { $0.id == displayName }
+                self.peerHellos[displayName] = nil
+                self.failClientInflight(forPeer: displayName)
+                self.cancelServerInflight(forPeer: displayName)
+                self.sessions.removeValue(forKey: displayName)
+                if wasKnown {
+                    self.onPeerDisconnect?(peer)
                 }
             @unknown default:
                 break
@@ -421,15 +473,6 @@ extension PeerService: MCSessionDelegate {
     nonisolated public func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, at localURL: URL?, withError error: Error?) {}
 }
 
-private extension PeerService {
-    var activePeerID: Peer.ID? {
-        switch connectionStatus {
-        case .connecting(let p), .connected(let p): return p.id
-        case .notConnected: return nil
-        }
-    }
-}
-
 // MARK: - MCNearbyServiceBrowserDelegate
 
 extension PeerService: MCNearbyServiceBrowserDelegate {
@@ -443,7 +486,9 @@ extension PeerService: MCNearbyServiceBrowserDelegate {
         Task { @MainActor in
             self.mcPeerIDs[displayName] = wrapped.value
             let peer = Peer(id: displayName, displayName: displayName)
-            if !self.availablePeers.contains(where: { $0.id == peer.id }) && self.activePeerID != peer.id {
+            let alreadyKnown = self.connectedPeers.contains(where: { $0.id == peer.id })
+                || self.connectingPeers.contains(peer.id)
+            if !self.availablePeers.contains(where: { $0.id == peer.id }) && !alreadyKnown {
                 self.availablePeers.append(peer)
             }
             // Stash a partial hello so the picker can preview offered services
@@ -472,8 +517,21 @@ extension PeerService: MCNearbyServiceBrowserDelegate {
 extension PeerService: MCNearbyServiceAdvertiserDelegate {
 
     nonisolated public func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        // 1:1 pairing: accept only if no one is connected yet.
-        let accept = session.connectedPeers.isEmpty
-        invitationHandler(accept, accept ? session : nil)
+        // Multi-peer: accept everyone. Each invitation gets its own MCSession,
+        // so disconnecting one peer doesn't drop the others.
+        let displayName = peerID.displayName
+        let session = MCSession(
+            peer: myMCPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .required
+        )
+        session.delegate = self
+        let wrappedPeer = SendableMCPeerID(peerID)
+        let wrappedSession = SendableMCSession(session)
+        Task { @MainActor in
+            self.mcPeerIDs[displayName] = wrappedPeer.value
+            self.sessions[displayName] = wrappedSession.value
+        }
+        invitationHandler(true, session)
     }
 }
